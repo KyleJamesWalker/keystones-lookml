@@ -124,13 +124,15 @@ class _Tree:
         for item in container.items:
             index = None
             key = self._key(item)
-            if counts[key] > 1:
+            if counts[key] > 1 and key[1] is None:
                 index = seen.get(key, 0)
                 seen[key] = index + 1
             offset = self._node(item, offset, prefix, index)
         return offset
 
     def _key(self, item) -> tuple[str, str | None]:
+        """What repeats: an unnamed block or a parameter by type. A named block
+        repeating is an error LookML itself rejects, left for C6 to report."""
         tree = self._tree
         named = isinstance(item, tree.BlockNode) and item.name
         return (item.type.value, item.name.value if named else None)
@@ -217,11 +219,20 @@ class _Tree:
         raise Unparseable(f"{definition.qualname} is not in this tree")
 
     def _dropped(self, name: str, path: tuple[str, ...]) -> bool:
-        """Dropped by name, unless a `!block.path.name` exception keeps it."""
+        """Dropped by name, unless a `!block.path.name` exception keeps it.
+
+        The path is relative to the block being rendered, so an exception is
+        matched on the tail either way: `case.when.label` keeps the label under
+        a keystone on the dimension and under one on the `when` block itself.
+        """
         if name not in self.drop:
             return False
         full = (*path, name)
-        return not any(full[-len(k) :] == k for k in self.keep if len(k) <= len(full))
+        for keep in self.keep:
+            shorter = min(len(keep), len(full))
+            if keep[-shorter:] == full[-shorter:]:
+                return False
+        return True
 
     def _canon(self, node, path: tuple[str, ...] = ()) -> object:
         tree = self._tree

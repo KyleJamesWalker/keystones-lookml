@@ -296,3 +296,28 @@ def test_pinned_rendering_hash(parser):
     text = rendered(parser, VIEW, "view.orders.measure.total")
     digest = "sha256:" + hashlib.sha256(text.encode()).hexdigest()
     assert digest == PINNED, digest
+
+
+def test_a_drop_exception_matches_relative_to_the_keystone_too():
+    """The same `!case.when.label` must hold whether the keystone sits on the
+    dimension or on the `when` block itself."""
+    parser = lookml(drop=["label", "!case.when.label"])
+    src = (
+        "view: v {\n  dimension: tier {\n    case: {\n"
+        '      when: {\n        sql: ${x} = 1 ;;\n        label: "a"\n      }\n'
+        '      when: {\n        sql: ${x} = 2 ;;\n        label: "b"\n      }\n'
+        "    }\n  }\n}\n"
+    )
+    second = "view.v.dimension.tier.case.when[1]"
+    before = rendered(parser, src, second)
+    assert rendered(parser, src.replace('label: "b"', 'label: "c"'), second) != before
+
+
+def test_duplicate_named_blocks_are_reported_not_numbered(parser):
+    src = (
+        "view: v {\n  dimension: x {\n    type: number\n  }\n"
+        "  dimension: x {\n    type: string\n  }\n}\n"
+    )
+    names = [d.qualname for d in parser.parse(src).definitions()]
+    assert names.count("view.v.dimension.x") == 2
+    assert "view.v.dimension.x[0]" not in names
