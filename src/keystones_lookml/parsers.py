@@ -23,12 +23,19 @@ from importlib.metadata import version
 from keystones.parser import Definition, Unparseable
 
 DEFAULT_DROP = ("description", "label")
+# Bumped whenever the canonical rendering changes, so `migrate` can prove
+# existing entries across instead of reading the change as drift.
+RENDER_VERSION = 2
 
 _COMMENT = re.compile(r"#[^\n]*")
 
 
 def lookml(*, drop: list[str] | tuple[str, ...] = DEFAULT_DROP):
-    if isinstance(drop, str) or not all(isinstance(d, str) and d for d in drop):
+    """`drop` names parameters left out of the hash. An entry starting with `!`
+    is an exception by block path, `!case.when.label`, kept in the hash."""
+    if isinstance(drop, str) or not all(
+        isinstance(d, str) and d.lstrip("!") for d in drop
+    ):
         raise ValueError("drop must be a list of parameter names")
     return LookmlParser(tuple(sorted(set(drop))), version("lkml"))
 
@@ -44,7 +51,7 @@ class LookmlParser:
 
     @property
     def identity(self) -> str:
-        return f"lkml@{self.version}"
+        return f"lkml@{self.version}/render{RENDER_VERSION}"
 
     def parse(self, src: str):
         import lkml
@@ -68,7 +75,8 @@ class _Tree:
 
         self.src = src
         self.document = document
-        self.drop = frozenset(drop)
+        self.drop = frozenset(d for d in drop if not d.startswith("!"))
+        self.keep = tuple(tuple(d[1:].split(".")) for d in drop if d.startswith("!"))
         self._tree = tree
         self._defs: list[tuple[Definition, object]] = []
         self._comments: list[tuple[int, str]] = []
@@ -105,34 +113,79 @@ class _Tree:
     def _container(self, container, offset: int, prefix: str) -> int:
         if container is None:
             return offset
+        # Repeated unnamed siblings (`when: {}` twice under a `case`) would
+        # share one qualname and the second would hash the first. They are
+        # numbered by position; a block that appears once keeps its name.
+        # Parameters repeat too: `include:` several times in a model file.
+        counts: dict[tuple[str, str | None], int] = {}
         for item in container.items:
-            offset = self._node(item, offset, prefix)
+            counts[self._key(item)] = counts.get(self._key(item), 0) + 1
+        seen: dict[tuple[str, str | None], int] = {}
+        for item in container.items:
+            index = None
+            key = self._key(item)
+            if counts[key] > 1 and key[1] is None:
+                index = seen.get(key, 0)
+                seen[key] = index + 1
+            offset = self._node(item, offset, prefix, index)
         return offset
 
-    def _node(self, node, offset: int, prefix: str) -> int:
+    def _key(self, item) -> tuple[str, str | None]:
+        """What repeats: an unnamed block or a parameter by type. A named block
+        repeating is an error LookML itself rejects, left for C6 to report."""
+        tree = self._tree
+        named = isinstance(item, tree.BlockNode) and item.name
+        return (item.type.value, item.name.value if named else None)
+
+    def _node(
+        self, node, offset: int, prefix: str, index: int | None = None, in_list=False
+    ) -> int:
         tree = self._tree
         if isinstance(node, tree.BlockNode):
-            return self._block(node, offset, prefix)
+            return self._block(node, offset, prefix, index)
         if isinstance(node, tree.PairNode):
+            start = node.type.line_number
             offset = self._token(node.type, offset)
             offset = self._token(node.colon, offset)
-            return self._token(node.value, offset)
+            offset = self._token(node.value, offset)
+            if not in_list:
+                end = offset - len(node.value.suffix)
+                self._parameter(node, prefix, start, end, index)
+            return offset
         if isinstance(node, tree.ListNode):
+            start = node.type.line_number
             offset = self._token(node.type, offset)
             offset = self._token(node.colon, offset)
             offset = self._token(node.left_bracket, offset)
             if node.leading_comma and node.items:
                 offset = self._token(node.leading_comma, offset)
-            for index, item in enumerate(node.items):
-                if index:
+            for i, item in enumerate(node.items):
+                if i:
                     offset += 1  # the comma lkml writes between items
-                offset = self._node(item, offset, prefix)
+                offset = self._node(item, offset, prefix, in_list=True)
             if node.trailing_comma and node.items:
                 offset = self._token(node.trailing_comma, offset)
-            return self._token(node.right_bracket, offset)
+            offset = self._token(node.right_bracket, offset)
+            end = offset - len(node.right_bracket.suffix)
+            self._parameter(node, prefix, start, end, index)
+            return offset
         return self._token(node, offset)
 
-    def _block(self, block, offset: int, prefix: str) -> int:
+    def _parameter(
+        self, node, prefix: str, start: int | None, end_offset: int, index=None
+    ) -> None:
+        """A parameter is addressable too, so a marker above `sql_always_where`
+        covers that line and not the whole explore around it."""
+        if start is None:
+            return
+        qualname = f"{prefix}.{node.type.value}" if prefix else node.type.value
+        if index is not None:
+            qualname += f"[{index}]"
+        self._defs.append(
+            (Definition(qualname, start, self._line(end_offset - 1)), node)
+        )
+
+    def _block(self, block, offset: int, prefix: str, index: int | None = None) -> int:
         start = block.type.line_number
         offset = self._token(block.type, offset)
         offset = self._token(block.colon, offset)
@@ -140,6 +193,8 @@ class _Tree:
         offset = self._token(block.left_brace, offset)
         name = block.name.value if block.name else None
         qualname = ".".join(p for p in (prefix, block.type.value, name) if p)
+        if index is not None:
+            qualname += f"[{index}]"
         offset = self._container(block.container, offset, qualname)
         brace = offset + len(block.right_brace.prefix)
         self._defs.append((Definition(qualname, start, self._line(brace)), block))
@@ -163,23 +218,41 @@ class _Tree:
                 return json.dumps(self._canon(block), sort_keys=True)
         raise Unparseable(f"{definition.qualname} is not in this tree")
 
-    def _canon(self, node) -> object:
+    def _dropped(self, name: str, path: tuple[str, ...]) -> bool:
+        """Dropped by name, unless a `!block.path.name` exception keeps it.
+
+        The path is relative to the block being rendered, so an exception is
+        matched on the tail either way: `case.when.label` keeps the label under
+        a keystone on the dimension and under one on the `when` block itself.
+        """
+        if name not in self.drop:
+            return False
+        full = (*path, name)
+        for keep in self.keep:
+            shorter = min(len(keep), len(full))
+            if keep[-shorter:] == full[-shorter:]:
+                return False
+        return True
+
+    def _canon(self, node, path: tuple[str, ...] = ()) -> object:
         tree = self._tree
         if isinstance(node, tree.BlockNode):
-            children = [
-                self._canon(i) for i in (node.container.items if node.container else ())
-            ]
+            inner = (*path, node.type.value)
+            items = node.container.items if node.container else ()
+            children = [self._canon(i, inner) for i in items]
             return {
                 "b": node.type.value,
                 "n": node.name.value if node.name else None,
                 "c": sorted((c for c in children if c is not None), key=json.dumps),
             }
         if isinstance(node, tree.PairNode):
-            if node.type.value in self.drop:
+            if self._dropped(node.type.value, path):
                 return None
             return ["p", node.type.value, *self._value(node.value)]
         if isinstance(node, tree.ListNode):
-            items = [self._canon(i) for i in node.items]
+            if self._dropped(node.type.value, path):
+                return None
+            items = [self._canon(i, path) for i in node.items]
             return ["l", node.type.value, [i for i in items if i is not None]]
         return list(self._value(node))
 

@@ -41,7 +41,7 @@ def test_identity_names_the_library_version(parser):
     from importlib.metadata import version
 
     assert parser.name == "lookml"
-    assert parser.identity == f"lkml@{version('lkml')}"
+    assert parser.identity.startswith(f"lkml@{version('lkml')}/render")
 
 
 def test_drop_must_be_names():
@@ -50,7 +50,11 @@ def test_drop_must_be_names():
 
 
 def test_blocks_are_definitions_with_line_spans(parser):
-    defs = parser.parse(VIEW).definitions()
+    from lkml.tree import BlockNode
+
+    tree = parser.parse(VIEW)
+    blocks = [d for d, node in tree._defs if isinstance(node, BlockNode)]
+    defs = sorted(blocks, key=lambda d: (d.start, d.qualname))
     assert [(d.qualname, d.start, d.end) for d in defs] == [
         ("view.orders", 2, 18),
         ("view.orders.measure.total", 5, 11),
@@ -127,7 +131,7 @@ def test_a_fragment_renders_like_the_block_in_context(parser):
 
     fragment = textwrap.dedent("\n".join(lines)) + "\n"
     tree = parser.parse_fragment(fragment)
-    [definition] = tree.definitions()
+    definition = tree.definitions()[0]
     assert tree.render(definition) == rendered(
         parser, VIEW, "view.orders.measure.total"
     )
@@ -143,3 +147,177 @@ def test_the_whole_document_renders_without_labels(parser):
 def test_bad_lookml_is_unparseable(parser):
     with pytest.raises(Unparseable):
         parser.parse("view: orders {\n  measure: total {\n")
+
+
+# --- repeated unnamed blocks, parameters, list drops, spacing -------------------
+
+CASES = """view: orders {
+  dimension: tier {
+    case: {
+      when: {
+        sql: ${TABLE}.amount > 100 ;;
+        label: "big"
+      }
+      when: {
+        sql: ${TABLE}.amount > 10 ;;
+        label: "mid"
+      }
+      else: "small"
+    }
+    tags: ["a", "b"]
+  }
+}
+
+explore: orders {
+  sql_always_where: ${orders.deleted} = false ;;
+  join: users {
+    sql_on: ${orders.user_id} = ${users.id} ;;
+  }
+}
+"""
+
+
+def test_repeated_unnamed_siblings_get_positional_qualnames(parser):
+    names = [d.qualname for d in parser.parse(CASES).definitions()]
+    assert "view.orders.dimension.tier.case.when[0]" in names
+    assert "view.orders.dimension.tier.case.when[1]" in names
+    assert "view.orders.dimension.tier.case.when" not in names
+    assert "view.orders.dimension.tier.case" in names, "a single block keeps its name"
+
+
+def test_the_second_when_is_its_own_target(parser):
+    second = "view.orders.dimension.tier.case.when[1]"
+    before = rendered(parser, CASES, second)
+    edited = CASES.replace("${TABLE}.amount > 10", "${TABLE}.amount > 20")
+    assert rendered(parser, edited, second) != before
+    edited = CASES.replace("${TABLE}.amount > 100", "${TABLE}.amount > 200")
+    assert rendered(parser, edited, second) == before, "the first when is not mine"
+
+
+def test_a_parameter_is_addressable(parser):
+    defs = {d.qualname: d for d in parser.parse(CASES).definitions()}
+    where = defs["explore.orders.sql_always_where"]
+    assert (where.start, where.end) == (19, 19)
+    before = parser.parse(CASES).render(where)
+    edited = CASES.replace("${orders.deleted} = false", "${orders.deleted} = true")
+    after = parser.parse(edited)
+    assert after.render(defs["explore.orders.sql_always_where"]) != before
+
+
+def test_a_parameter_fragment_renders_like_the_parameter_in_context(parser):
+    import textwrap
+
+    line = CASES.splitlines()[18]
+    tree = parser.parse_fragment(textwrap.dedent(line) + "\n")
+    [definition] = tree.definitions()
+    expected = rendered(parser, CASES, "explore.orders.sql_always_where")
+    assert tree.render(definition) == expected
+
+
+def test_drop_applies_to_lists():
+    parser = lookml(drop=["tags"])
+    before = rendered(parser, CASES, "view.orders.dimension.tier")
+    edited = CASES.replace('tags: ["a", "b"]', 'tags: ["a"]')
+    assert rendered(parser, edited, "view.orders.dimension.tier") == before
+
+
+def test_spacing_between_list_items_is_not_a_change(parser):
+    before = rendered(parser, CASES, "view.orders.dimension.tier")
+    edited = CASES.replace('tags: ["a", "b"]', 'tags: ["a","b"]')
+    assert rendered(parser, edited, "view.orders.dimension.tier") == before
+
+
+# --- repeated parameters, scoped drops, a versioned rendering ----------------------
+
+MODEL = """connection: "warehouse"
+include: "views/*.view.lkml"
+include: "views/*.dashboard.lkml"
+
+explore: orders {
+  join: users {
+    sql_on: ${orders.user_id} = ${users.id} ;;
+  }
+}
+"""
+
+
+def test_repeated_parameters_are_numbered_not_duplicated(parser):
+    names = [d.qualname for d in parser.parse(MODEL).definitions()]
+    assert "include[0]" in names and "include[1]" in names
+    assert names.count("include") == 0
+    assert "connection" in names, "a parameter that appears once keeps its name"
+
+
+def test_a_case_when_label_is_semantic_and_kept():
+    """`label` inside `case.when` is the value the dimension returns."""
+    parser = lookml(drop=["label", "!case.when.label"])
+    src = (
+        'view: v {\n  dimension: tier {\n    label: "Tier"\n    case: {\n'
+        '      when: {\n        sql: ${x} = 1 ;;\n        label: "a"\n      }\n'
+        "    }\n  }\n}\n"
+    )
+    before = rendered(parser, src, "view.v.dimension.tier")
+    assert (
+        rendered(
+            parser, src.replace('label: "a"', 'label: "b"'), "view.v.dimension.tier"
+        )
+        != before
+    )
+    assert (
+        rendered(
+            parser,
+            src.replace('label: "Tier"', 'label: "Rank"'),
+            "view.v.dimension.tier",
+        )
+        == before
+    )
+
+
+def test_a_bad_drop_exception_is_a_value_error():
+    with pytest.raises(ValueError):
+        lookml(drop=["!"])
+
+
+def test_identity_carries_the_rendering_version(parser):
+    from importlib.metadata import version
+
+    from keystones_lookml.parsers import RENDER_VERSION
+
+    assert parser.identity == f"lkml@{version('lkml')}/render{RENDER_VERSION}"
+
+
+# A moved canary means the rendering changed; bump RENDER_VERSION with it.
+PINNED = "sha256:b4fb307980cbb19843469ee9845559f5bde35faa6191df72569914513e4913a0"
+
+
+def test_pinned_rendering_hash(parser):
+    import hashlib
+
+    text = rendered(parser, VIEW, "view.orders.measure.total")
+    digest = "sha256:" + hashlib.sha256(text.encode()).hexdigest()
+    assert digest == PINNED, digest
+
+
+def test_a_drop_exception_matches_relative_to_the_keystone_too():
+    """The same `!case.when.label` must hold whether the keystone sits on the
+    dimension or on the `when` block itself."""
+    parser = lookml(drop=["label", "!case.when.label"])
+    src = (
+        "view: v {\n  dimension: tier {\n    case: {\n"
+        '      when: {\n        sql: ${x} = 1 ;;\n        label: "a"\n      }\n'
+        '      when: {\n        sql: ${x} = 2 ;;\n        label: "b"\n      }\n'
+        "    }\n  }\n}\n"
+    )
+    second = "view.v.dimension.tier.case.when[1]"
+    before = rendered(parser, src, second)
+    assert rendered(parser, src.replace('label: "b"', 'label: "c"'), second) != before
+
+
+def test_duplicate_named_blocks_are_reported_not_numbered(parser):
+    src = (
+        "view: v {\n  dimension: x {\n    type: number\n  }\n"
+        "  dimension: x {\n    type: string\n  }\n}\n"
+    )
+    names = [d.qualname for d in parser.parse(src).definitions()]
+    assert names.count("view.v.dimension.x") == 2
+    assert "view.v.dimension.x[0]" not in names
