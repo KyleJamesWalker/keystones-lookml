@@ -41,7 +41,7 @@ def test_identity_names_the_library_version(parser):
     from importlib.metadata import version
 
     assert parser.name == "lookml"
-    assert parser.identity == f"lkml@{version('lkml')}"
+    assert parser.identity.startswith(f"lkml@{version('lkml')}/render")
 
 
 def test_drop_must_be_names():
@@ -225,3 +225,74 @@ def test_spacing_between_list_items_is_not_a_change(parser):
     before = rendered(parser, CASES, "view.orders.dimension.tier")
     edited = CASES.replace('tags: ["a", "b"]', 'tags: ["a","b"]')
     assert rendered(parser, edited, "view.orders.dimension.tier") == before
+
+
+# --- repeated parameters, scoped drops, a versioned rendering ----------------------
+
+MODEL = """connection: "warehouse"
+include: "views/*.view.lkml"
+include: "views/*.dashboard.lkml"
+
+explore: orders {
+  join: users {
+    sql_on: ${orders.user_id} = ${users.id} ;;
+  }
+}
+"""
+
+
+def test_repeated_parameters_are_numbered_not_duplicated(parser):
+    names = [d.qualname for d in parser.parse(MODEL).definitions()]
+    assert "include[0]" in names and "include[1]" in names
+    assert names.count("include") == 0
+    assert "connection" in names, "a parameter that appears once keeps its name"
+
+
+def test_a_case_when_label_is_semantic_and_kept():
+    """`label` inside `case.when` is the value the dimension returns."""
+    parser = lookml(drop=["label", "!case.when.label"])
+    src = (
+        'view: v {\n  dimension: tier {\n    label: "Tier"\n    case: {\n'
+        '      when: {\n        sql: ${x} = 1 ;;\n        label: "a"\n      }\n'
+        "    }\n  }\n}\n"
+    )
+    before = rendered(parser, src, "view.v.dimension.tier")
+    assert (
+        rendered(
+            parser, src.replace('label: "a"', 'label: "b"'), "view.v.dimension.tier"
+        )
+        != before
+    )
+    assert (
+        rendered(
+            parser,
+            src.replace('label: "Tier"', 'label: "Rank"'),
+            "view.v.dimension.tier",
+        )
+        == before
+    )
+
+
+def test_a_bad_drop_exception_is_a_value_error():
+    with pytest.raises(ValueError):
+        lookml(drop=["!"])
+
+
+def test_identity_carries_the_rendering_version(parser):
+    from importlib.metadata import version
+
+    from keystones_lookml.parsers import RENDER_VERSION
+
+    assert parser.identity == f"lkml@{version('lkml')}/render{RENDER_VERSION}"
+
+
+# A moved canary means the rendering changed; bump RENDER_VERSION with it.
+PINNED = "sha256:b4fb307980cbb19843469ee9845559f5bde35faa6191df72569914513e4913a0"
+
+
+def test_pinned_rendering_hash(parser):
+    import hashlib
+
+    text = rendered(parser, VIEW, "view.orders.measure.total")
+    digest = "sha256:" + hashlib.sha256(text.encode()).hexdigest()
+    assert digest == PINNED, digest

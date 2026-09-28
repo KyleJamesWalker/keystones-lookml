@@ -23,12 +23,19 @@ from importlib.metadata import version
 from keystones.parser import Definition, Unparseable
 
 DEFAULT_DROP = ("description", "label")
+# Bumped whenever the canonical rendering changes, so `migrate` can prove
+# existing entries across instead of reading the change as drift.
+RENDER_VERSION = 2
 
 _COMMENT = re.compile(r"#[^\n]*")
 
 
 def lookml(*, drop: list[str] | tuple[str, ...] = DEFAULT_DROP):
-    if isinstance(drop, str) or not all(isinstance(d, str) and d for d in drop):
+    """`drop` names parameters left out of the hash. An entry starting with `!`
+    is an exception by block path, `!case.when.label`, kept in the hash."""
+    if isinstance(drop, str) or not all(
+        isinstance(d, str) and d.lstrip("!") for d in drop
+    ):
         raise ValueError("drop must be a list of parameter names")
     return LookmlParser(tuple(sorted(set(drop))), version("lkml"))
 
@@ -44,7 +51,7 @@ class LookmlParser:
 
     @property
     def identity(self) -> str:
-        return f"lkml@{self.version}"
+        return f"lkml@{self.version}/render{RENDER_VERSION}"
 
     def parse(self, src: str):
         import lkml
@@ -68,7 +75,8 @@ class _Tree:
 
         self.src = src
         self.document = document
-        self.drop = frozenset(drop)
+        self.drop = frozenset(d for d in drop if not d.startswith("!"))
+        self.keep = tuple(tuple(d[1:].split(".")) for d in drop if d.startswith("!"))
         self._tree = tree
         self._defs: list[tuple[Definition, object]] = []
         self._comments: list[tuple[int, str]] = []
@@ -108,22 +116,24 @@ class _Tree:
         # Repeated unnamed siblings (`when: {}` twice under a `case`) would
         # share one qualname and the second would hash the first. They are
         # numbered by position; a block that appears once keeps its name.
-        tree = self._tree
+        # Parameters repeat too: `include:` several times in a model file.
         counts: dict[tuple[str, str | None], int] = {}
         for item in container.items:
-            if isinstance(item, tree.BlockNode):
-                key = (item.type.value, item.name.value if item.name else None)
-                counts[key] = counts.get(key, 0) + 1
+            counts[self._key(item)] = counts.get(self._key(item), 0) + 1
         seen: dict[tuple[str, str | None], int] = {}
         for item in container.items:
             index = None
-            if isinstance(item, tree.BlockNode):
-                key = (item.type.value, item.name.value if item.name else None)
-                if counts[key] > 1:
-                    index = seen.get(key, 0)
-                    seen[key] = index + 1
+            key = self._key(item)
+            if counts[key] > 1:
+                index = seen.get(key, 0)
+                seen[key] = index + 1
             offset = self._node(item, offset, prefix, index)
         return offset
+
+    def _key(self, item) -> tuple[str, str | None]:
+        tree = self._tree
+        named = isinstance(item, tree.BlockNode) and item.name
+        return (item.type.value, item.name.value if named else None)
 
     def _node(
         self, node, offset: int, prefix: str, index: int | None = None, in_list=False
@@ -137,7 +147,8 @@ class _Tree:
             offset = self._token(node.colon, offset)
             offset = self._token(node.value, offset)
             if not in_list:
-                self._parameter(node, prefix, start, offset - len(node.value.suffix))
+                end = offset - len(node.value.suffix)
+                self._parameter(node, prefix, start, end, index)
             return offset
         if isinstance(node, tree.ListNode):
             start = node.type.line_number
@@ -153,18 +164,21 @@ class _Tree:
             if node.trailing_comma and node.items:
                 offset = self._token(node.trailing_comma, offset)
             offset = self._token(node.right_bracket, offset)
-            self._parameter(
-                node, prefix, start, offset - len(node.right_bracket.suffix)
-            )
+            end = offset - len(node.right_bracket.suffix)
+            self._parameter(node, prefix, start, end, index)
             return offset
         return self._token(node, offset)
 
-    def _parameter(self, node, prefix: str, start: int | None, end_offset: int) -> None:
+    def _parameter(
+        self, node, prefix: str, start: int | None, end_offset: int, index=None
+    ) -> None:
         """A parameter is addressable too, so a marker above `sql_always_where`
         covers that line and not the whole explore around it."""
         if start is None:
             return
         qualname = f"{prefix}.{node.type.value}" if prefix else node.type.value
+        if index is not None:
+            qualname += f"[{index}]"
         self._defs.append(
             (Definition(qualname, start, self._line(end_offset - 1)), node)
         )
@@ -202,25 +216,32 @@ class _Tree:
                 return json.dumps(self._canon(block), sort_keys=True)
         raise Unparseable(f"{definition.qualname} is not in this tree")
 
-    def _canon(self, node) -> object:
+    def _dropped(self, name: str, path: tuple[str, ...]) -> bool:
+        """Dropped by name, unless a `!block.path.name` exception keeps it."""
+        if name not in self.drop:
+            return False
+        full = (*path, name)
+        return not any(full[-len(k) :] == k for k in self.keep if len(k) <= len(full))
+
+    def _canon(self, node, path: tuple[str, ...] = ()) -> object:
         tree = self._tree
         if isinstance(node, tree.BlockNode):
-            children = [
-                self._canon(i) for i in (node.container.items if node.container else ())
-            ]
+            inner = (*path, node.type.value)
+            items = node.container.items if node.container else ()
+            children = [self._canon(i, inner) for i in items]
             return {
                 "b": node.type.value,
                 "n": node.name.value if node.name else None,
                 "c": sorted((c for c in children if c is not None), key=json.dumps),
             }
         if isinstance(node, tree.PairNode):
-            if node.type.value in self.drop:
+            if self._dropped(node.type.value, path):
                 return None
             return ["p", node.type.value, *self._value(node.value)]
         if isinstance(node, tree.ListNode):
-            if node.type.value in self.drop:
+            if self._dropped(node.type.value, path):
                 return None
-            items = [self._canon(i) for i in node.items]
+            items = [self._canon(i, path) for i in node.items]
             return ["l", node.type.value, [i for i in items if i is not None]]
         return list(self._value(node))
 
