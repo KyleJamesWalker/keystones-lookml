@@ -50,7 +50,11 @@ def test_drop_must_be_names():
 
 
 def test_blocks_are_definitions_with_line_spans(parser):
-    defs = parser.parse(VIEW).definitions()
+    from lkml.tree import BlockNode
+
+    tree = parser.parse(VIEW)
+    blocks = [d for d, node in tree._defs if isinstance(node, BlockNode)]
+    defs = sorted(blocks, key=lambda d: (d.start, d.qualname))
     assert [(d.qualname, d.start, d.end) for d in defs] == [
         ("view.orders", 2, 18),
         ("view.orders.measure.total", 5, 11),
@@ -127,7 +131,7 @@ def test_a_fragment_renders_like_the_block_in_context(parser):
 
     fragment = textwrap.dedent("\n".join(lines)) + "\n"
     tree = parser.parse_fragment(fragment)
-    [definition] = tree.definitions()
+    definition = tree.definitions()[0]
     assert tree.render(definition) == rendered(
         parser, VIEW, "view.orders.measure.total"
     )
@@ -143,3 +147,81 @@ def test_the_whole_document_renders_without_labels(parser):
 def test_bad_lookml_is_unparseable(parser):
     with pytest.raises(Unparseable):
         parser.parse("view: orders {\n  measure: total {\n")
+
+
+# --- repeated unnamed blocks, parameters, list drops, spacing -------------------
+
+CASES = """view: orders {
+  dimension: tier {
+    case: {
+      when: {
+        sql: ${TABLE}.amount > 100 ;;
+        label: "big"
+      }
+      when: {
+        sql: ${TABLE}.amount > 10 ;;
+        label: "mid"
+      }
+      else: "small"
+    }
+    tags: ["a", "b"]
+  }
+}
+
+explore: orders {
+  sql_always_where: ${orders.deleted} = false ;;
+  join: users {
+    sql_on: ${orders.user_id} = ${users.id} ;;
+  }
+}
+"""
+
+
+def test_repeated_unnamed_siblings_get_positional_qualnames(parser):
+    names = [d.qualname for d in parser.parse(CASES).definitions()]
+    assert "view.orders.dimension.tier.case.when[0]" in names
+    assert "view.orders.dimension.tier.case.when[1]" in names
+    assert "view.orders.dimension.tier.case.when" not in names
+    assert "view.orders.dimension.tier.case" in names, "a single block keeps its name"
+
+
+def test_the_second_when_is_its_own_target(parser):
+    second = "view.orders.dimension.tier.case.when[1]"
+    before = rendered(parser, CASES, second)
+    edited = CASES.replace("${TABLE}.amount > 10", "${TABLE}.amount > 20")
+    assert rendered(parser, edited, second) != before
+    edited = CASES.replace("${TABLE}.amount > 100", "${TABLE}.amount > 200")
+    assert rendered(parser, edited, second) == before, "the first when is not mine"
+
+
+def test_a_parameter_is_addressable(parser):
+    defs = {d.qualname: d for d in parser.parse(CASES).definitions()}
+    where = defs["explore.orders.sql_always_where"]
+    assert (where.start, where.end) == (19, 19)
+    before = parser.parse(CASES).render(where)
+    edited = CASES.replace("${orders.deleted} = false", "${orders.deleted} = true")
+    after = parser.parse(edited)
+    assert after.render(defs["explore.orders.sql_always_where"]) != before
+
+
+def test_a_parameter_fragment_renders_like_the_parameter_in_context(parser):
+    import textwrap
+
+    line = CASES.splitlines()[18]
+    tree = parser.parse_fragment(textwrap.dedent(line) + "\n")
+    [definition] = tree.definitions()
+    expected = rendered(parser, CASES, "explore.orders.sql_always_where")
+    assert tree.render(definition) == expected
+
+
+def test_drop_applies_to_lists():
+    parser = lookml(drop=["tags"])
+    before = rendered(parser, CASES, "view.orders.dimension.tier")
+    edited = CASES.replace('tags: ["a", "b"]', 'tags: ["a"]')
+    assert rendered(parser, edited, "view.orders.dimension.tier") == before
+
+
+def test_spacing_between_list_items_is_not_a_change(parser):
+    before = rendered(parser, CASES, "view.orders.dimension.tier")
+    edited = CASES.replace('tags: ["a", "b"]', 'tags: ["a","b"]')
+    assert rendered(parser, edited, "view.orders.dimension.tier") == before

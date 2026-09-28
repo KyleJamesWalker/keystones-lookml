@@ -105,34 +105,71 @@ class _Tree:
     def _container(self, container, offset: int, prefix: str) -> int:
         if container is None:
             return offset
+        # Repeated unnamed siblings (`when: {}` twice under a `case`) would
+        # share one qualname and the second would hash the first. They are
+        # numbered by position; a block that appears once keeps its name.
+        tree = self._tree
+        counts: dict[tuple[str, str | None], int] = {}
         for item in container.items:
-            offset = self._node(item, offset, prefix)
+            if isinstance(item, tree.BlockNode):
+                key = (item.type.value, item.name.value if item.name else None)
+                counts[key] = counts.get(key, 0) + 1
+        seen: dict[tuple[str, str | None], int] = {}
+        for item in container.items:
+            index = None
+            if isinstance(item, tree.BlockNode):
+                key = (item.type.value, item.name.value if item.name else None)
+                if counts[key] > 1:
+                    index = seen.get(key, 0)
+                    seen[key] = index + 1
+            offset = self._node(item, offset, prefix, index)
         return offset
 
-    def _node(self, node, offset: int, prefix: str) -> int:
+    def _node(
+        self, node, offset: int, prefix: str, index: int | None = None, in_list=False
+    ) -> int:
         tree = self._tree
         if isinstance(node, tree.BlockNode):
-            return self._block(node, offset, prefix)
+            return self._block(node, offset, prefix, index)
         if isinstance(node, tree.PairNode):
+            start = node.type.line_number
             offset = self._token(node.type, offset)
             offset = self._token(node.colon, offset)
-            return self._token(node.value, offset)
+            offset = self._token(node.value, offset)
+            if not in_list:
+                self._parameter(node, prefix, start, offset - len(node.value.suffix))
+            return offset
         if isinstance(node, tree.ListNode):
+            start = node.type.line_number
             offset = self._token(node.type, offset)
             offset = self._token(node.colon, offset)
             offset = self._token(node.left_bracket, offset)
             if node.leading_comma and node.items:
                 offset = self._token(node.leading_comma, offset)
-            for index, item in enumerate(node.items):
-                if index:
+            for i, item in enumerate(node.items):
+                if i:
                     offset += 1  # the comma lkml writes between items
-                offset = self._node(item, offset, prefix)
+                offset = self._node(item, offset, prefix, in_list=True)
             if node.trailing_comma and node.items:
                 offset = self._token(node.trailing_comma, offset)
-            return self._token(node.right_bracket, offset)
+            offset = self._token(node.right_bracket, offset)
+            self._parameter(
+                node, prefix, start, offset - len(node.right_bracket.suffix)
+            )
+            return offset
         return self._token(node, offset)
 
-    def _block(self, block, offset: int, prefix: str) -> int:
+    def _parameter(self, node, prefix: str, start: int | None, end_offset: int) -> None:
+        """A parameter is addressable too, so a marker above `sql_always_where`
+        covers that line and not the whole explore around it."""
+        if start is None:
+            return
+        qualname = f"{prefix}.{node.type.value}" if prefix else node.type.value
+        self._defs.append(
+            (Definition(qualname, start, self._line(end_offset - 1)), node)
+        )
+
+    def _block(self, block, offset: int, prefix: str, index: int | None = None) -> int:
         start = block.type.line_number
         offset = self._token(block.type, offset)
         offset = self._token(block.colon, offset)
@@ -140,6 +177,8 @@ class _Tree:
         offset = self._token(block.left_brace, offset)
         name = block.name.value if block.name else None
         qualname = ".".join(p for p in (prefix, block.type.value, name) if p)
+        if index is not None:
+            qualname += f"[{index}]"
         offset = self._container(block.container, offset, qualname)
         brace = offset + len(block.right_brace.prefix)
         self._defs.append((Definition(qualname, start, self._line(brace)), block))
@@ -179,6 +218,8 @@ class _Tree:
                 return None
             return ["p", node.type.value, *self._value(node.value)]
         if isinstance(node, tree.ListNode):
+            if node.type.value in self.drop:
+                return None
             items = [self._canon(i) for i in node.items]
             return ["l", node.type.value, [i for i in items if i is not None]]
         return list(self._value(node))
